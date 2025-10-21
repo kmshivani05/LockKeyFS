@@ -1,0 +1,340 @@
+// lockkeyfs.c
+#define FUSE_USE_VERSION 26
+
+#include <fuse.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/err.h>
+
+#define MAGIC "LKFS"   // 4 bytes
+#define SALT_LEN 16
+#define IV_LEN 16
+#define KEY_LEN 32     // AES-256
+#define HEADER_LEN (4 + SALT_LEN + IV_LEN)
+
+static char *backing_dir = NULL;
+static const int MAX_FILE_BYTES = 16 * 1024 * 1024; // 16 MB limit for prototype
+
+// Helpers
+static void join_path(const char *dir, const char *name, char *out, size_t outlen) {
+    snprintf(out, outlen, "%s/%s", dir, name[0]=='/'?name+1:name);
+}
+
+static int derive_key(const char *pass, const unsigned char *salt, unsigned char *key_out) {
+    // PBKDF2 with SHA256, 100k iterations (adjust for performance)
+    if (!PKCS5_PBKDF2_HMAC(pass, strlen(pass),
+                           salt, SALT_LEN,
+                           100000, EVP_sha256(),
+                           KEY_LEN, key_out)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int encrypt_buf(const unsigned char *plaintext, int plaintext_len,
+                       const unsigned char *key, const unsigned char *iv,
+                       unsigned char **ciphertext_out, int *cipher_len_out) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int len, ciphertext_len;
+    *ciphertext_out = malloc(plaintext_len + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    if (!*ciphertext_out) { EVP_CIPHER_CTX_free(ctx); return -1; }
+
+    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) goto err;
+    if (1 != EVP_EncryptUpdate(ctx, *ciphertext_out, &len, plaintext, plaintext_len)) goto err;
+    ciphertext_len = len;
+    if (1 != EVP_EncryptFinal_ex(ctx, *ciphertext_out + len, &len)) goto err;
+    ciphertext_len += len;
+
+    *cipher_len_out = ciphertext_len;
+    EVP_CIPHER_CTX_free(ctx);
+    return 0;
+err:
+    free(*ciphertext_out);
+    *ciphertext_out = NULL;
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+}
+
+static int decrypt_buf(const unsigned char *ciphertext, int cipher_len,
+                       const unsigned char *key, const unsigned char *iv,
+                       unsigned char **plaintext_out, int *plain_len_out) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int len, plaintext_len;
+    *plaintext_out = malloc(cipher_len + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    if (!*plaintext_out) { EVP_CIPHER_CTX_free(ctx); return -1; }
+
+    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) goto err;
+    if (1 != EVP_DecryptUpdate(ctx, *plaintext_out, &len, ciphertext, cipher_len)) goto err;
+    plaintext_len = len;
+    if (1 != EVP_DecryptFinal_ex(ctx, *plaintext_out + len, &len)) goto err;
+    plaintext_len += len;
+
+    *plain_len_out = plaintext_len;
+    EVP_CIPHER_CTX_free(ctx);
+    return 0;
+err:
+    free(*plaintext_out);
+    *plaintext_out = NULL;
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+}
+
+// Read & decrypt whole backing file
+static int read_decrypted_whole(const char *path, unsigned char **out, size_t *outlen) {
+    char full[PATH_MAX];
+    join_path(backing_dir, path, full, sizeof(full));
+
+    FILE *f = fopen(full, "rb");
+    if (!f) return -errno;
+
+    // read header
+    unsigned char header[HEADER_LEN];
+    if (fread(header, 1, HEADER_LEN, f) != HEADER_LEN) { fclose(f); return -EIO; }
+    if (memcmp(header, MAGIC, 4) != 0) { fclose(f); return -EIO; }
+
+    unsigned char salt[SALT_LEN];
+    unsigned char iv[IV_LEN];
+    memcpy(salt, header + 4, SALT_LEN);
+    memcpy(iv, header + 4 + SALT_LEN, IV_LEN);
+
+    // read ciphertext
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f) - HEADER_LEN;
+    fseek(f, HEADER_LEN, SEEK_SET);
+    if (fsize < 0 || fsize > MAX_FILE_BYTES) { fclose(f); return -EFBIG; }
+
+    unsigned char *cipher = malloc(fsize);
+    if (!cipher) { fclose(f); return -ENOMEM; }
+    if (fread(cipher, 1, fsize, f) != (size_t)fsize) { free(cipher); fclose(f); return -EIO; }
+    fclose(f);
+
+    const char *pass = getenv("LOCKKEY_PASSPHRASE");
+    if (!pass) { free(cipher); return -EPERM; }
+    unsigned char key[KEY_LEN];
+    if (derive_key(pass, salt, key) != 0) { free(cipher); return -EIO; }
+
+    unsigned char *plain = NULL;
+    int plain_len = 0;
+    if (decrypt_buf(cipher, (int)fsize, key, iv, &plain, &plain_len) != 0) { free(cipher); return -EIO; }
+    free(cipher);
+
+    *out = plain;
+    *outlen = plain_len;
+    return 0;
+}
+
+// Encrypt whole buffer and write to backing file (atomically write to temp then rename)
+static int write_encrypted_whole(const char *path, const unsigned char *data, size_t datalen) {
+    char full[PATH_MAX];
+    join_path(backing_dir, path, full, sizeof(full));
+    // create parent dir if needed - assuming flat backing_dir for prototype
+
+    unsigned char salt[SALT_LEN], iv[IV_LEN];
+    if (1 != RAND_bytes(salt, SALT_LEN)) return -EIO;
+    if (1 != RAND_bytes(iv, IV_LEN)) return -EIO;
+
+    const char *pass = getenv("LOCKKEY_PASSPHRASE");
+    if (!pass) return -EPERM;
+    unsigned char key[KEY_LEN];
+    if (derive_key(pass, salt, key) != 0) return -EIO;
+
+    unsigned char *cipher = NULL;
+    int cipher_len = 0;
+    if (encrypt_buf(data, (int)datalen, key, iv, &cipher, &cipher_len) != 0) return -EIO;
+
+    // write to temp file
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmpXXXXXX", full);
+    int fd = mkstemp(tmp);
+    if (fd < 0) { free(cipher); return -errno; }
+
+    // write header
+    if (write(fd, MAGIC, 4) != 4) { close(fd); unlink(tmp); free(cipher); return -EIO; }
+    if (write(fd, salt, SALT_LEN) != SALT_LEN) { close(fd); unlink(tmp); free(cipher); return -EIO; }
+    if (write(fd, iv, IV_LEN) != IV_LEN) { close(fd); unlink(tmp); free(cipher); return -EIO; }
+
+    ssize_t w = write(fd, cipher, cipher_len);
+    if (w != cipher_len) { close(fd); unlink(tmp); free(cipher); return -EIO; }
+    close(fd);
+    free(cipher);
+
+    // rename to real file
+    if (rename(tmp, full) != 0) { unlink(tmp); return -errno; }
+    return 0;
+}
+
+/* FUSE ops */
+
+static int lk_getattr(const char *path, struct stat *stbuf) {
+    (void) fi;
+    memset(stbuf, 0, sizeof(struct stat));
+    if (strcmp(path, "/") == 0) {
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        return 0;
+    }
+    // Backing file path
+    char _path[PATH_MAX];
+    join_path(backing_dir, path, _path, sizeof(_path));
+
+    struct stat st;
+    if (stat(_path, &st) == 0) {
+        // We need to present the decrypted size to user -> read header and decrypt to get plain length
+        unsigned char *plain = NULL;
+        size_t plain_len = 0;
+        int r = read_decrypted_whole(path, &plain, &plain_len);
+        if (r == 0) {
+            stbuf->st_mode = S_IFREG | 0644;
+            stbuf->st_nlink = 1;
+            stbuf->st_size = plain_len;
+            free(plain);
+            return 0;
+        } else if (r == -EPERM) { return -EPERM; }
+        // if decryption failed, fallback to encrypted size so stat doesn't crash
+        stbuf->st_mode = S_IFREG | 0644;
+        stbuf->st_nlink = 1;
+        stbuf->st_size = st.st_size - HEADER_LEN;
+        return 0;
+    }
+    return -ENOENT;
+}
+
+static int lk_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+               off_t offset, struct fuse_file_info *fi) {
+    (void) offset; (void) fi; (void) flags;
+    if (strcmp(path, "/") != 0) return -ENOENT;
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
+
+    DIR *d = opendir(backing_dir);
+    if (!d) return -errno;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
+            filler(buf, entry->d_name, NULL, 0);
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+static int lk_open(const char *path, struct fuse_file_info *fi) {
+    // allow open if underlying file exists or mode allows create - actual read/write handled in read/write
+    char _path[PATH_MAX];
+    join_path(backing_dir, path, _path, sizeof(_path));
+    if (access(_path, F_OK) != 0) return -ENOENT;
+    return 0;
+}
+
+static int lk_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    (void) mode; (void) fi;
+    // create empty encrypted file
+    unsigned char empty = 0;
+    return write_encrypted_whole(path, &empty, 0);
+}
+
+static int lk_read(const char *path, char *buf, size_t size, off_t offset,
+             struct fuse_file_info *fi) {
+    (void) fi;
+    unsigned char *plain = NULL;
+    size_t plain_len = 0;
+    int r = read_decrypted_whole(path, &plain, &plain_len);
+    if (r < 0) return r;
+    if ((size_t) offset < plain_len) {
+        size_t tocopy = size;
+        if (offset + tocopy > plain_len) tocopy = plain_len - offset;
+        memcpy(buf, plain + offset, tocopy);
+        free(plain);
+        return tocopy;
+    } else {
+        free(plain);
+        return 0;
+    }
+}
+
+static int lk_write(const char *path, const char *buf, size_t size, off_t offset,
+              struct fuse_file_info *fi) {
+    (void) fi;
+    unsigned char *plain = NULL;
+    size_t plain_len = 0;
+    int r = read_decrypted_whole(path, &plain, &plain_len);
+    if (r == -EPERM) return -EPERM;
+    if (r != 0) {
+        // file might not exist; create new buffer
+        plain_len = 0;
+        plain = malloc(offset + size);
+        if (!plain) return -ENOMEM;
+        memset(plain, 0, offset + size);
+    } else {
+        // ensure buffer big enough
+        if ((size_t)offset + size > plain_len) {
+            unsigned char *n = realloc(plain, offset + size);
+            if (!n) { free(plain); return -ENOMEM; }
+            // zero the new area
+            if ((size_t)offset > plain_len) memset(n + plain_len, 0, offset - plain_len);
+            plain = n;
+            plain_len = offset + size;
+        }
+    }
+    memcpy(plain + offset, buf, size);
+    int w = write_encrypted_whole(path, plain, plain_len);
+    free(plain);
+    if (w != 0) return w;
+    return size;
+}
+
+static int lk_unlink(const char *path) {
+    char full[PATH_MAX];
+    join_path(backing_dir, path, full, sizeof(full));
+    if (unlink(full) != 0) return -errno;
+    return 0;
+}
+
+static const struct fuse_operations lk_oper = {
+    .getattr = lk_getattr,
+    .readdir = lk_readdir,
+    .open    = lk_open,
+    .create  = lk_create,
+    .read    = lk_read,
+    .write   = lk_write,
+    .unlink  = lk_unlink,
+};
+
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <backing_dir> <mountpoint> [fuse-args]\n", argv[0]);
+        return 1;
+    }
+    backing_dir = realpath(argv[1], NULL);
+    if (!backing_dir) { perror("backing_dir"); return 1; }
+
+    // Build new argv for fuse_main (skip first two args)
+    int newargc = argc - 1;
+    char **newargv = malloc(sizeof(char*) * newargc);
+    newargv[0] = argv[0];
+    newargv[1] = argv[2]; // mountpoint
+    for (int i = 3; i < argc; ++i) newargv[i-1] = argv[i];
+    newargv[newargc-1] = NULL;
+
+    // init OpenSSL (not strictly needed on modern OpenSSL, but safe)
+    OpenSSL_add_all_algorithms();
+    ERR_load_crypto_strings();
+
+    int ret = fuse_main(newargc-1, newargv, &lk_oper, NULL);
+
+    EVP_cleanup();
+    ERR_free_strings();
+    free(backing_dir);
+    free(newargv);
+    return ret;
+}
